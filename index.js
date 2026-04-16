@@ -1,35 +1,15 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
+const fetch = require('node-fetch');
 
-// 🌟 SECURE FIREBASE URL FROM GITHUB SECRETS 🌟
 const FIREBASE_URL = process.env.FIREBASE_URL;
 
-const orderStates = {}; 
-
-// Function to fetch the dynamic menu from your App's Firebase
-async function getMenuFromApp() {
-    try {
-        const response = await fetch(`${FIREBASE_URL}/dishes.json`);
-        const data = await response.json();
-        if (!data) return[];
-        
-        // Convert Firebase object into an array (now includes imageUrl)
-        return Object.keys(data).map(key => ({
-            id: key,
-            name: data[key].name,
-            price: data[key].price,
-            imageUrl: data[key].imageUrl
-        }));
-    } catch (error) {
-        console.error("Failed to fetch menu:", error);
-        return[];
-    }
-}
+const userStates = {};
 
 async function startBot() {
     if (!FIREBASE_URL) {
-        console.log("❌ ERROR: FIREBASE_URL is missing in GitHub Secrets!");
+        console.log("❌ FIREBASE_URL missing!");
         process.exit(1);
     }
 
@@ -40,22 +20,20 @@ async function startBot() {
         version,
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser:["S", "K", "1"] 
+        logger: pino({ level: 'silent' })
     });
 
+    // CONNECTION
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
+
         if (qr) {
-            console.clear(); 
-            console.log('\n==================================================');
-            console.log('⚠️ QR CODE TOO BIG? CLICK "View raw logs" in top right!');
-            console.log('==================================================\n');
-            qrcode.generate(qr, { small: true }); 
+            console.clear();
+            qrcode.generate(qr, { small: true });
         }
 
-        if (connection === 'open') console.log('✅ GRAMPANCHAYAT AI IS ONLINE!');
+        if (connection === 'open') console.log("✅ Panchayat Bot Online");
+
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
             if (reason !== DisconnectReason.loggedOut) startBot();
@@ -64,120 +42,169 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // MESSAGE HANDLER
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
-        if (msg.key.fromMe) return; // Loop Protection
+        if (!msg.message || msg.key.fromMe) return;
 
         const sender = msg.key.remoteJid;
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").toLowerCase();
 
-        console.log(`📩 Query: ${text}`);
+        console.log("📩", text);
 
-        // --- 🛒 STEP 2: FINISH ORDER & SEND TO ADMIN PANEL ---
-        if (orderStates[sender]?.step === 'WAITING_FOR_ADDRESS') {
-            const customerDetails = text; // This now contains Name, Phone, and Address
-            const item = orderStates[sender].item;
-            const customerWaNumber = sender.split('@')[0];
+        // ======================
+        // STEP 2: SAVE COMPLAINT
+        // ======================
+        if (userStates[sender]?.step === 'WAITING_DETAILS') {
 
-            // Match the exact format of your GramPanchayat Admin Panel
-            const javaGoatOrder = {
-                userId: "whatsapp_" + customerWaNumber,
-                userEmail: "whatsapp@javagoat.com",
-                phone: customerWaNumber, // Keeps their WA number registered
-                address: customerDetails, // Saves Name, Phone, and Address typed by them
-                location: { lat: 0, lng: 0 },
-                items:[{
-                    id: item.id,
-                    name: item.name,
-                    price: parseFloat(item.price),
-                    img: item.imageUrl || "",
-                    quantity: 1
-                }],
-                total: (parseFloat(item.price) + 50).toFixed(2), // Price + 50 Delivery Fee
-                status: "Placed",
-                method: "Cash on Delivery (WhatsApp)",
-                timestamp: new Date().toISOString()
+            const details = text;
+            const issue = userStates[sender].issue;
+            const phone = sender.split('@')[0];
+
+            let category = "General";
+            if (issue.includes("water")) category = "Water";
+            else if (issue.includes("drain")) category = "Drain";
+            else if (issue.includes("road")) category = "Road";
+            else if (issue.includes("light")) category = "Street Light";
+
+            const complaint = {
+                userId: "whatsapp_" + phone,
+                phone: phone,
+                category: category,
+                description: issue,
+                details: details,
+                status: "Pending",
+                statusUpdated: false,
+                notified: false,
+                createdAt: new Date().toISOString()
             };
 
-            // Save order securely via REST API
             try {
-                await fetch(`${FIREBASE_URL}/orders.json`, {
+                await fetch(`${FIREBASE_URL}/complaints.json`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(javaGoatOrder)
+                    body: JSON.stringify(complaint)
                 });
-            } catch (error) {
-                console.log("Firebase Error: ", error);
+
+                await sock.sendMessage(sender, {
+                    text: `✅ మీ ఫిర్యాదు నమోదు అయింది!\n\n📌 సమస్య: ${issue}\n📊 స్థితి: Pending\n\nధన్యవాదాలు 🙏`
+                });
+
+            } catch (err) {
+                console.log("Firebase Error:", err);
             }
 
-            await sock.sendMessage(sender, { text: `✅ *Order Placed Successfully!* \n\nThank you! Your order for *${item.name}* is being prepared. \n\n*Total:* ₹${javaGoatOrder.total} (Inc. Delivery)\n*Status:* Preparing\n\nWe will deliver it to your address soon.` });
-            delete orderStates[sender]; 
+            delete userStates[sender];
             return;
         }
 
-        // --- 🌟 STEP 1: START ORDER FLOW (WITH IMAGE & PHONE REQUEST) ---
-        if (text.startsWith("order ")) {
-            const productRequested = text.replace("order ", "").trim().toLowerCase();
-            const currentMenu = await getMenuFromApp();
-            
-            // Search the live database for the requested item
-            const matchedItem = currentMenu.find(item => item.name.toLowerCase().includes(productRequested));
+        // ======================
+        // STEP 1: START COMPLAINT
+        // ======================
+        if (text.startsWith("complaint")) {
+            const issue = text.replace("complaint", "").trim();
 
-            if (!matchedItem) {
-                await sock.sendMessage(sender, { text: `❌ Sorry, we couldn't find *${productRequested}* in our menu today.\n\nType *menu* to see all available items.` });
-                return;
-            }
-
-            orderStates[sender] = { step: 'WAITING_FOR_ADDRESS', item: matchedItem };
-            
-            // 🌟 NEW: SEND PRODUCT IMAGE + ASK FOR PHONE NUMBER 🌟
-            const captionText = `🛒 *Order Started!* \n\nYou selected: *${matchedItem.name}* (₹${matchedItem.price})\n\nPlease reply with your *Full Name, Phone Number, and Delivery Address*.`;
-            
-            // If the product has an image URL in Firebase, send it as a WhatsApp Photo
-            if (matchedItem.imageUrl) {
-                await sock.sendMessage(sender, { 
-                    image: { url: matchedItem.imageUrl }, 
-                    caption: captionText 
+            if (!issue) {
+                await sock.sendMessage(sender, {
+                    text: "⚠️ దయచేసి సమస్యను వ్రాయండి.\nExample: complaint water problem"
                 });
-            } else {
-                // Fallback if no image is found
-                await sock.sendMessage(sender, { text: captionText });
-            }
-        }
-        else if (text === "order") { 
-            await sock.sendMessage(sender, { text: "🛒 *How to order:* \nPlease type 'order' followed by the dish name. \nExample: *order pizza*" });
-        }
-        
-        // --- DYNAMIC MENU FEATURE ---
-        else if (text.includes("menu") || text.includes("price") || text.includes("list") || text.includes("food")) {
-            const currentMenu = await getMenuFromApp();
-            
-            if (currentMenu.length === 0) {
-                await sock.sendMessage(sender, { text: "Our menu is currently empty or updating. Please check back soon!" });
                 return;
             }
 
-            let menuMessage = "🍔 *GRAMPACHAYAT LIVE MENU* 🍕\n\n";
-            currentMenu.forEach(item => {
-                menuMessage += `🔸 *${item.name}* - ₹${item.price}\n`;
+            userStates[sender] = {
+                step: 'WAITING_DETAILS',
+                issue: issue
+            };
+
+            await sock.sendMessage(sender, {
+                text: `📝 ఫిర్యాదు నమోదు ప్రారంభం\n\nసమస్య: *${issue}*\n\nమీ పేరు, ఫోన్, చిరునామా పంపండి`
             });
-            menuMessage += "\n_To order, reply with 'order [dish name]'_";
-            
-            await sock.sendMessage(sender, { text: menuMessage });
+
+            return;
         }
 
-        // --- GREETINGS ---
-        else if (text.includes("hi") || text.includes("hello") || text.includes("hey")) {
-            await sock.sendMessage(sender, { text: "👋 *Welcome to GramPanchayat!* \n\nI am your AI Assistant. Type *menu* to see our delicious food, or type *order [dish]* to buy instantly!" });
+        // ======================
+        // STATUS CHECK
+        // ======================
+        if (text.includes("status")) {
+            const phone = sender.split('@')[0];
+
+            try {
+                const res = await fetch(`${FIREBASE_URL}/complaints.json`);
+                const data = await res.json();
+
+                if (!data) {
+                    await sock.sendMessage(sender, { text: "❌ ఫిర్యాదులు లేవు" });
+                    return;
+                }
+
+                let reply = "📊 మీ ఫిర్యాదులు:\n\n";
+
+                Object.values(data).forEach(c => {
+                    if (c.phone === phone) {
+                        reply += `🔸 ${c.description} → ${c.status}\n`;
+                    }
+                });
+
+                await sock.sendMessage(sender, { text: reply });
+
+            } catch (err) {
+                console.log(err);
+            }
+
+            return;
         }
-        else if (text.includes("contact") || text.includes("call")) {
-            await sock.sendMessage(sender, { text: "📞 *Contact GramPanchayat:* \n\n- *Email:* support@javagoat.com" });
+
+        // ======================
+        // GREETING
+        // ======================
+        if (text.includes("hi") || text.includes("hello")) {
+            await sock.sendMessage(sender, {
+                text: `👋 స్వాగతం!\n\n👉 complaint [problem]\n👉 status`
+            });
+            return;
         }
-        else {
-            await sock.sendMessage(sender, { text: "🤔 I didn't quite catch that.\n\nType *menu* to see our food list, or *order [food]* to place an order!" });
-        }
+
+        // ======================
+        // DEFAULT
+        // ======================
+        await sock.sendMessage(sender, {
+            text: `🤖 అర్థం కాలేదు\n\n👉 complaint water problem\n👉 status`
+        });
     });
+
+    // ======================
+    // AUTO STATUS UPDATE
+    // ======================
+    setInterval(async () => {
+        try {
+            const res = await fetch(`${FIREBASE_URL}/complaints.json`);
+            const data = await res.json();
+
+            if (!data) return;
+
+            for (const id in data) {
+                const c = data[id];
+
+                if (c.statusUpdated && !c.notified) {
+                    const jid = c.phone + "@s.whatsapp.net";
+
+                    await sock.sendMessage(jid, {
+                        text: `📢 మీ ఫిర్యాదు స్థితి: ${c.status}`
+                    });
+
+                    await fetch(`${FIREBASE_URL}/complaints/${id}.json`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ notified: true })
+                    });
+                }
+            }
+
+        } catch (err) {
+            console.log("Auto update error:", err);
+        }
+    }, 10000);
 }
 
-startBot().catch(err => console.log("Error: " + err));
+startBot();
