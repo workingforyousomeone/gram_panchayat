@@ -1,4 +1,4 @@
-name: Panchayat Bot
+name: JavaGoat-WhatsApp-Bot
 
 on:
   workflow_dispatch:
