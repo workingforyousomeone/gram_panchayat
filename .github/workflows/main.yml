@@ -23,4 +23,4 @@ jobs:
       - name: Start AI Bot
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
-        run: npm start
+        run: node index.js
